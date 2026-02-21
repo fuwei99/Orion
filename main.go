@@ -1103,16 +1103,9 @@ done:
 // ══════════════════════════════════════════════════════════════════════════
 
 func handleModels(w http.ResponseWriter, r *http.Request) {
-	models := []string{
-		"claude-opus-4-6", "claude-opus-4-5",
-		"claude-sonnet-4-6", "claude-sonnet-4-5", "claude-sonnet-4",
-		"claude-3-5-sonnet", "claude-3-5-haiku", "claude-haiku-4-5",
-		"gpt-4o", "gpt-4o-mini", "o1", "o3-mini",
-		"gemini-2.0-flash", "gemini-2.5-pro",
-	}
-	data := make([]any, len(models))
-	for i, m := range models {
-		data[i] = map[string]any{"id": m, "object": "model", "created": 1700000000, "owned_by": "onyx"}
+	data := make([]any, 0, len(modelMap))
+	for m := range modelMap {
+		data = append(data, map[string]any{"id": m, "object": "model", "created": 1700000000, "owned_by": "onyx"})
 	}
 	writeJSON(w, 200, map[string]any{"object": "list", "data": data})
 }

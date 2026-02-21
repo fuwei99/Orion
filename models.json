@@ -7,6 +7,10 @@
         "provider": "Anthropic",
         "version": "claude-opus-4-5"
     },
+    "claude-opus-4-1": {
+        "provider": "Anthropic",
+        "version": "claude-opus-4-1"
+    },
     "claude-sonnet-4-6": {
         "provider": "Anthropic",
         "version": "claude-sonnet-4-6"
@@ -19,18 +23,6 @@
         "provider": "Anthropic",
         "version": "claude-sonnet-4-20250514"
     },
-    "claude-3-5-sonnet": {
-        "provider": "Anthropic",
-        "version": "claude-3-5-sonnet-20241022"
-    },
-    "claude-3-5-haiku": {
-        "provider": "Anthropic",
-        "version": "claude-3-5-haiku-20241022"
-    },
-    "claude-3-opus": {
-        "provider": "Anthropic",
-        "version": "claude-3-opus-20240229"
-    },
     "claude-haiku-4-5": {
         "provider": "Anthropic",
         "version": "claude-haiku-4-5"
@@ -38,18 +30,6 @@
     "gpt-4o": {
         "provider": "OpenAI",
         "version": "gpt-4o"
-    },
-    "gpt-4o-mini": {
-        "provider": "OpenAI",
-        "version": "gpt-4o-mini"
-    },
-    "gpt-4-turbo": {
-        "provider": "OpenAI",
-        "version": "gpt-4-turbo"
-    },
-    "gpt-4": {
-        "provider": "OpenAI",
-        "version": "gpt-4"
     },
     "o1": {
         "provider": "OpenAI",
@@ -62,14 +42,6 @@
     "o3-mini": {
         "provider": "OpenAI",
         "version": "o3-mini"
-    },
-    "gemini-2.0-flash": {
-        "provider": "Google",
-        "version": "gemini-2.0-flash"
-    },
-    "gemini-2.5-pro": {
-        "provider": "Google",
-        "version": "gemini-2.5-pro-preview-05-06"
     },
     "gpt-5.2-pro": {
         "provider": "OpenAI",
@@ -91,8 +63,8 @@
         "provider": "OpenAI",
         "version": "chatgpt-4o-latest"
     },
-    "gemini-3.1-pro-preview": {
-        "provider": "Google",
-        "version": "gemini-3.1-pro-preview"
+    "gpt-5.3-codex": {
+        "provider": "OpenAI",
+        "version": "gpt-5.3-codex"
     }
 }

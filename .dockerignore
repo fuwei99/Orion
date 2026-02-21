@@ -1,0 +1,7 @@
+.git
+.gitignore
+*.md
+deploy.sh
+onyx2api.service
+onyx2api
+onyx2api-linux-amd64

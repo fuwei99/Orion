@@ -3,6 +3,7 @@ WORKDIR /src
 
 COPY go.mod ./
 COPY main.go ./
+COPY models.json ./
 
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/onyx2api .
 
@@ -10,6 +11,7 @@ FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /
 
 COPY --from=builder /out/onyx2api /onyx2api
+COPY --from=builder /src/models.json /models.json
 
 ENV PORT=7860
 EXPOSE 7860

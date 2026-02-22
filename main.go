@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -47,6 +48,7 @@ var (
 	}
 	keys       []string
 	clientKeys map[string]struct{}
+	bannedKeys sync.Map
 	keyIdx     uint64
 )
 
@@ -57,7 +59,27 @@ func nextKey() string {
 	if n == 0 {
 		return ""
 	}
+	for i := 0; i < n; i++ {
+		k := keys[atomic.AddUint64(&keyIdx, 1)%uint64(n)]
+		if _, banned := bannedKeys.Load(k); !banned {
+			return k
+		}
+	}
+	// Fallback to random if all banned
 	return keys[atomic.AddUint64(&keyIdx, 1)%uint64(n)]
+}
+
+func banKey(key string) {
+	if key == "" {
+		return
+	}
+	if _, loaded := bannedKeys.LoadOrStore(key, true); !loaded {
+		short := key
+		if len(short) > 8 {
+			short = short[:8] + "..."
+		}
+		log.Printf("[Key Ban] Key %s has been banned due to server error", short)
+	}
 }
 
 func extractToken(s string) string {
@@ -268,7 +290,7 @@ func (e *onyxError) Error() string {
 	return fmt.Sprintf("Onyx HTTP %d: %s", e.Status, e.Body)
 }
 
-func doOnyxRequest(ctx context.Context, token, model string, msgs []chatMsg, system string, temp float64, persona int) (*http.Response, error) {
+func doOnyxRequest(ctx context.Context, token, model string, msgs []chatMsg, system string, temp float64, persona int) (*http.Response, string, error) {
 	bodyBytes, err := json.Marshal(map[string]any{
 		"message":           messagesToOnyx(system, msgs),
 		"chat_session_info": map[string]any{"persona_id": persona},
@@ -279,13 +301,13 @@ func doOnyxRequest(ctx context.Context, token, model string, msgs []chatMsg, sys
 		"origin":            "api",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("marshal onyx request: %w", err)
+		return nil, "", fmt.Errorf("marshal onyx request: %w", err)
 	}
 
 	var lastErr error
 	for attempt := range maxRetries + 1 {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		cur := token
 		if attempt > 0 && len(keys) > 0 {
@@ -300,7 +322,7 @@ func doOnyxRequest(ctx context.Context, token, model string, msgs []chatMsg, sys
 			bytes.NewReader(bodyBytes),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("create onyx request: %w", err)
+			return nil, "", fmt.Errorf("create onyx request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+cur)
@@ -308,14 +330,14 @@ func doOnyxRequest(ctx context.Context, token, model string, msgs []chatMsg, sys
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil, err
+				return nil, "", err
 			}
 			lastErr = err
 			if attempt < maxRetries {
 				wait := retryBackoff[min(attempt, len(retryBackoff)-1)]
 				log.Printf("Attempt %d failed (%v), retry in %v", attempt+1, err, wait)
 				if !sleepOrDone(ctx, wait) {
-					return nil, ctx.Err()
+					return nil, "", ctx.Err()
 				}
 				continue
 			}
@@ -330,15 +352,15 @@ func doOnyxRequest(ctx context.Context, token, model string, msgs []chatMsg, sys
 				wait := retryBackoff[min(attempt, len(retryBackoff)-1)]
 				log.Printf("Attempt %d failed (HTTP %d), retry in %v", attempt+1, resp.StatusCode, wait)
 				if !sleepOrDone(ctx, wait) {
-					return nil, ctx.Err()
+					return nil, "", ctx.Err()
 				}
 				continue
 			}
-			return nil, &onyxError{Status: resp.StatusCode, Body: string(body)}
+			return nil, "", &onyxError{Status: resp.StatusCode, Body: string(body)}
 		}
-		return resp, nil
+		return resp, cur, nil
 	}
-	return nil, fmt.Errorf("all retries failed: %v", lastErr)
+	return nil, "", fmt.Errorf("all retries failed: %v", lastErr)
 }
 
 // ── Onyx NDJSON scanner ────────────────────────────────────────────────
@@ -403,7 +425,7 @@ func makeChunk(id string, created int64, model string, delta map[string]any, fin
 	}
 }
 
-func streamOpenAI(w io.Writer, flush func(), body io.Reader, model, rid string) {
+func streamOpenAI(w io.Writer, flush func(), body io.Reader, model, rid, token string) {
 	created := time.Now().Unix()
 	sentRole := false
 	toolActive := false
@@ -515,6 +537,9 @@ func streamOpenAI(w io.Writer, flush func(), body io.Reader, model, rid string) 
 			break
 		}
 		if ev.Err != "" {
+			if strings.Contains(ev.Err, "unexpected error occurred") {
+				banKey(token)
+			}
 			flushBuf(true)
 			emit(map[string]any{"content": "\n\n[Error: " + ev.Err + "]"}, &stop)
 			w.Write(sseDone)
@@ -679,6 +704,9 @@ func streamOpenAI(w io.Writer, flush func(), body io.Reader, model, rid string) 
 			if msg == "" {
 				msg = "Unknown error"
 			}
+			if strings.Contains(msg, "unexpected error occurred") {
+				banKey(token)
+			}
 			emit(map[string]any{"content": "\n[Error: " + msg + "]"}, &stop)
 			w.Write(sseDone)
 			flush()
@@ -694,7 +722,7 @@ func streamOpenAI(w io.Writer, flush func(), body io.Reader, model, rid string) 
 	flush()
 }
 
-func collectOpenAI(body io.Reader) string {
+func collectOpenAI(body io.Reader, token string) string {
 	var parts, toolCtx []string
 	scan := newOnyxScanner(body)
 	for {
@@ -703,6 +731,9 @@ func collectOpenAI(body io.Reader) string {
 			break
 		}
 		if ev.Err != "" {
+			if strings.Contains(ev.Err, "unexpected error occurred") {
+				banKey(token)
+			}
 			parts = append(parts, "\n[Error: "+ev.Err+"]")
 			break
 		}
@@ -763,6 +794,9 @@ func collectOpenAI(body io.Reader) string {
 			}
 		case "error":
 			msg, _ := obj["error"].(string)
+			if strings.Contains(msg, "unexpected error occurred") {
+				banKey(token)
+			}
 			parts = append(parts, "\n[Error: "+msg+"]")
 		case "stop":
 			goto done
@@ -788,7 +822,7 @@ func anthropicSSE(event string, data any) []byte {
 	return []byte("event: " + event + "\ndata: " + string(b) + "\n\n")
 }
 
-func streamAnthropic(w io.Writer, flush func(), body io.Reader, model, rid string) {
+func streamAnthropic(w io.Writer, flush func(), body io.Reader, model, rid, token string) {
 	scan := newOnyxScanner(body)
 	blockIdx := 0
 	inThinking := false
@@ -848,6 +882,9 @@ func streamAnthropic(w io.Writer, flush func(), body io.Reader, model, rid strin
 			break
 		}
 		if ev.Err != "" {
+			if strings.Contains(ev.Err, "unexpected error occurred") {
+				banKey(token)
+			}
 			if !inText {
 				startBlock("text")
 				inText = true
@@ -1088,6 +1125,9 @@ func streamAnthropic(w io.Writer, flush func(), body io.Reader, model, rid strin
 			if msg == "" {
 				msg = "Unknown error"
 			}
+			if strings.Contains(msg, "unexpected error occurred") {
+				banKey(token)
+			}
 			if !inText {
 				startBlock("text")
 				inText = true
@@ -1108,7 +1148,7 @@ func streamAnthropic(w io.Writer, flush func(), body io.Reader, model, rid strin
 	finishMsg("end_turn")
 }
 
-func collectAnthropic(body io.Reader) (text, thinking string) {
+func collectAnthropic(body io.Reader, token string) (text, thinking string) {
 	var textParts, thinkParts, toolCtx []string
 	scan := newOnyxScanner(body)
 	for {
@@ -1117,6 +1157,9 @@ func collectAnthropic(body io.Reader) (text, thinking string) {
 			break
 		}
 		if ev.Err != "" {
+			if strings.Contains(ev.Err, "unexpected error occurred") {
+				banKey(token)
+			}
 			textParts = append(textParts, "\n[Error: "+ev.Err+"]")
 			break
 		}
@@ -1181,6 +1224,9 @@ func collectAnthropic(body io.Reader) (text, thinking string) {
 			}
 		case "error":
 			msg, _ := obj["error"].(string)
+			if strings.Contains(msg, "unexpected error occurred") {
+				banKey(token)
+			}
 			textParts = append(textParts, "\n[Error: "+msg+"]")
 		case "stop":
 			goto done
@@ -1297,7 +1343,7 @@ func handleOpenAI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rid := genID("chatcmpl-")
-	resp, err := doOnyxRequest(r.Context(), token, model, req.Messages, system, temp, persona)
+	resp, usedToken, err := doOnyxRequest(r.Context(), token, model, req.Messages, system, temp, persona)
 	if err != nil {
 		if oe, ok := err.(*onyxError); ok {
 			writeJSON(w, oe.Status, map[string]any{"error": oe.Error(), "detail": oe.Body})
@@ -1318,9 +1364,9 @@ func handleOpenAI(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 500, map[string]any{"error": "streaming unsupported"})
 			return
 		}
-		streamOpenAI(w, flusher.Flush, resp.Body, model, rid)
+		streamOpenAI(w, flusher.Flush, resp.Body, model, rid, usedToken)
 	} else {
-		content := collectOpenAI(resp.Body)
+		content := collectOpenAI(resp.Body, usedToken)
 		writeJSON(w, 200, map[string]any{
 			"id": rid, "object": "chat.completion", "created": time.Now().Unix(), "model": model,
 			"choices": []any{map[string]any{
@@ -1384,7 +1430,7 @@ func handleAnthropic(w http.ResponseWriter, r *http.Request) {
 	system := textContent(req.System)
 
 	rid := genID("msg_")
-	resp, err := doOnyxRequest(r.Context(), token, model, req.Messages, system, temp, persona)
+	resp, usedToken, err := doOnyxRequest(r.Context(), token, model, req.Messages, system, temp, persona)
 	if err != nil {
 		if oe, ok := err.(*onyxError); ok {
 			writeJSON(w, oe.Status, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": oe.Error()}})
@@ -1405,9 +1451,9 @@ func handleAnthropic(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 500, map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": "streaming unsupported"}})
 			return
 		}
-		streamAnthropic(w, flusher.Flush, resp.Body, model, rid)
+		streamAnthropic(w, flusher.Flush, resp.Body, model, rid, usedToken)
 	} else {
-		text, thinking := collectAnthropic(resp.Body)
+		text, thinking := collectAnthropic(resp.Body, usedToken)
 		var content []any
 		if thinking != "" {
 			content = append(content, map[string]any{"type": "thinking", "thinking": thinking})
@@ -1423,6 +1469,31 @@ func handleAnthropic(w http.ResponseWriter, r *http.Request) {
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
+
+type responseRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *responseRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *responseRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rr := &responseRecorder{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rr, r)
+		log.Printf("[HTTP] %d | %s %s | %v", rr.status, r.Method, r.URL.Path, time.Since(start))
+	})
+}
 
 func main() {
 	if env := os.Getenv("ONYX_KEYS"); env != "" {
@@ -1454,7 +1525,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           mux,
+		Handler:           loggingMiddleware(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
 		IdleTimeout:       120 * time.Second,

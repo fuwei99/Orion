@@ -167,11 +167,7 @@ func textContent(raw any) string {
 	}
 }
 
-type chatMsg struct {
-	Role       string `json:"role"`
-	Content    any    `json:"content"`
-	ToolCallID string `json:"tool_call_id,omitempty"`
-}
+// defined below in openaiReq
 
 func messagesToOnyx(system string, msgs []chatMsg) string {
 	var conv []string
@@ -190,13 +186,18 @@ func messagesToOnyx(system string, msgs []chatMsg) string {
 			lastUser = c
 			conv = append(conv, "\bHuman: "+c)
 		case "assistant":
-			conv = append(conv, "\bAssistant: "+c)
+			var tb strings.Builder
+			tb.WriteString(c)
+			for _, tc := range m.ToolCalls {
+				tb.WriteString(fmt.Sprintf("\n<tool_call>\n{\"name\": \"%s\", \"arguments\": %s}\n</tool_call>", tc.Function.Name, tc.Function.Arguments))
+			}
+			conv = append(conv, "\bAssistant: "+tb.String())
 		case "tool":
 			tid := m.ToolCallID
 			if tid == "" {
 				tid = "unknown"
 			}
-			conv = append(conv, fmt.Sprintf("Tool result (%s): %s", tid, c))
+			conv = append(conv, fmt.Sprintf("\bHuman: Tool result for %s:\n%s", tid, c))
 		}
 	}
 
@@ -420,12 +421,101 @@ func streamOpenAI(w io.Writer, flush func(), body io.Reader, model, rid string) 
 		}
 	}
 
+	var textBuf string
+	inTool := false
+	toolIdx := 0
+
+	// 抽出一个新的辅助闭包专门用来向客户端 flush
+	flushBuf := func(force bool) {
+		if textBuf == "" {
+			return
+		}
+		if !inTool {
+			// 在正常文本模式下，寻找 <tool_call>
+			toolStart := strings.Index(textBuf, "<tool_call>")
+			if toolStart != -1 {
+				// 匹配到了，先发前面安全的文本
+				if toolStart > 0 {
+					safeText := textBuf[:toolStart]
+					d := map[string]any{"content": safeText}
+					ensureRole(d)
+					emit(d, nil)
+				}
+				// 转换状态
+				inTool = true
+				textBuf = textBuf[toolStart+len("<tool_call>"):]
+				return // 也许缓冲区后续还有 </tool_call>，靠下一次触发解析
+			}
+
+			// 如果没找到，但末尾极其相似，可能被切断了，憋住！
+			lastCut := -1
+			for i := len(textBuf) - 1; i >= 0 && i >= len(textBuf)-20; i-- {
+				if textBuf[i] == '<' {
+					lastCut = i
+					break
+				}
+			}
+			if lastCut != -1 && !force {
+				if lastCut > 0 {
+					d := map[string]any{"content": textBuf[:lastCut]}
+					ensureRole(d)
+					emit(d, nil)
+				}
+				textBuf = textBuf[lastCut:] // 留下嫌疑部分
+			} else {
+				d := map[string]any{"content": textBuf}
+				ensureRole(d)
+				emit(d, nil)
+				textBuf = ""
+			}
+		} else {
+			// 当前正在获取 Tool 参数
+			toolEnd := strings.Index(textBuf, "</tool_call>")
+			if toolEnd != -1 {
+				rawJSON := textBuf[:toolEnd]
+				// 尝试解析并组建 toolcall
+				var tCall struct {
+					Name      string `json:"name"`
+					Arguments any    `json:"arguments"`
+				}
+				if err := json.Unmarshal([]byte(rawJSON), &tCall); err == nil {
+					argsStr := ""
+					switch val := tCall.Arguments.(type) {
+					case string:
+						argsStr = val
+					default:
+						b, _ := json.Marshal(val)
+						argsStr = string(b)
+					}
+					emit(map[string]any{
+						"tool_calls": []any{
+							map[string]any{
+								"index": toolIdx,
+								"id":    genID("call_"),
+								"type":  "function",
+								"function": map[string]any{
+									"name":      tCall.Name,
+									"arguments": argsStr,
+								},
+							},
+						},
+					}, nil)
+					toolIdx++
+				}
+				inTool = false
+				textBuf = textBuf[toolEnd+len("</tool_call>"):]
+				// 回去接着冲剩下的字符串，如果还有剩余文本
+			}
+		}
+	}
+
 	for {
 		ev, ok := scan.Next()
 		if !ok {
 			break
 		}
 		if ev.Err != "" {
+			flushBuf(true)
 			emit(map[string]any{"content": "\n\n[Error: " + ev.Err + "]"}, &stop)
 			w.Write(sseDone)
 			flush()
@@ -445,9 +535,15 @@ func streamOpenAI(w io.Writer, flush func(), body io.Reader, model, rid string) 
 			}
 		case "message_delta":
 			if c, _ := obj["content"].(string); c != "" {
-				d := map[string]any{"content": c}
-				ensureRole(d)
-				emit(d, nil)
+				textBuf += c
+				// 反复 flush 直到缓冲区平稳
+				for {
+					oldLen := len(textBuf)
+					flushBuf(false)
+					if len(textBuf) == oldLen {
+						break
+					}
+				}
 			}
 		case "search_tool_start":
 			toolActive = true
@@ -572,11 +668,13 @@ func streamOpenAI(w io.Writer, flush func(), body io.Reader, model, rid string) 
 				toolActive = false
 			}
 		case "stop":
+			flushBuf(true)
 			emit(map[string]any{}, &stop)
 			w.Write(sseDone)
 			flush()
 			return
 		case "error":
+			flushBuf(true)
 			msg, _ := obj["error"].(string)
 			if msg == "" {
 				msg = "Unknown error"
@@ -591,6 +689,7 @@ func streamOpenAI(w io.Writer, flush func(), body io.Reader, model, rid string) 
 			}
 		}
 	}
+	flushBuf(true)
 	w.Write(sseDone)
 	flush()
 }
@@ -1128,12 +1227,29 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 
 // ── OpenAI: POST /v1/chat/completions ──
 
+type toolCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type chatMsg struct {
+	Role       string     `json:"role"`
+	Content    any        `json:"content"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+}
+
 type openaiReq struct {
 	Model       string    `json:"model"`
 	Messages    []chatMsg `json:"messages"`
 	Stream      bool      `json:"stream"`
 	Temperature *float64  `json:"temperature,omitempty"`
 	PersonaID   *int      `json:"persona_id,omitempty"`
+	Tools       []any     `json:"tools,omitempty"`
 }
 
 func handleOpenAI(w http.ResponseWriter, r *http.Request) {
@@ -1173,8 +1289,15 @@ func handleOpenAI(w http.ResponseWriter, r *http.Request) {
 		persona = *req.PersonaID
 	}
 
+	system := ""
+	if len(req.Tools) > 0 {
+		toolsJSON, _ := json.Marshal(req.Tools)
+		system = "You have access to the following tools:\n" + string(toolsJSON) +
+			"\nIf you need to use a tool, you must output EXACTLY the following format:\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"arg_name\": \"arg_value\"}}\n</tool_call>\nYou can call multiple tools by outputting multiple <tool_call> blocks."
+	}
+
 	rid := genID("chatcmpl-")
-	resp, err := doOnyxRequest(r.Context(), token, model, req.Messages, "", temp, persona)
+	resp, err := doOnyxRequest(r.Context(), token, model, req.Messages, system, temp, persona)
 	if err != nil {
 		if oe, ok := err.(*onyxError); ok {
 			writeJSON(w, oe.Status, map[string]any{"error": oe.Error(), "detail": oe.Body})

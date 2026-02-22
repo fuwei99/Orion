@@ -47,10 +47,6 @@
         "provider": "OpenAI",
         "version": "gpt-5.2"
     },
-    "gpt-5.2-codex": {
-        "provider": "OpenAI",
-        "version": "codex-mini"
-    },
     "gpt-5.2": {
         "provider": "OpenAI",
         "version": "gpt-5.2"
@@ -58,13 +54,5 @@
     "gpt-5.2-chat-latest": {
         "provider": "OpenAI",
         "version": "gpt-5-mini"
-    },
-    "chatgpt-4o-latest": {
-        "provider": "OpenAI",
-        "version": "chatgpt-4o-latest"
-    },
-    "gpt-5.3-codex": {
-        "provider": "OpenAI",
-        "version": "gpt-5.3-codex"
     }
 }
